@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  terraform:
+    name: terraform fmt and validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout demo
+        uses: actions/checkout@v4
+
+      - name: Checkout azapi provider spike
+        uses: actions/checkout@v4
+        with:
+          repository: kewalaka/terraform-provider-azapi
+          ref: kewalaka/spike-ai-search-dataplane-read
+          path: terraform-provider-azapi
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: terraform-provider-azapi/go.sum
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: '~1.14'
+
+      - name: Build local provider
+        run: make build-provider PROVIDER_SRC=$(pwd)/terraform-provider-azapi
+
+      - name: Terraform init
+        run: make init PROVIDER_SRC=$(pwd)/terraform-provider-azapi
+
+      - name: Terraform fmt check
+        run: make fmt-check
+
+      - name: Terraform validate
+        run: make validate PROVIDER_SRC=$(pwd)/terraform-provider-azapi
