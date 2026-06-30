@@ -12,7 +12,7 @@ The configuration creates:
 
 ## Prerequisites
 
-- Go 1.25 or newer.
+- Go 1.26 or newer (the provider's `go.mod` requires `go 1.26.0`).
 - Terraform 1.13 or newer.
 - Azure CLI authenticated with `az login`.
 - An Azure subscription selected via `az account set` or `ARM_SUBSCRIPTION_ID`.
@@ -75,3 +75,44 @@ make destroy
 ```
 
 If data-plane operations return `403`, wait for RBAC propagation and rerun `make apply`, or increase `rbac_propagation_delay`.
+
+## Continuous integration
+
+`.github/workflows/integration.yml` is an end-to-end integration test modelled on
+[`terraform-azapi-global-outputs`](https://github.com/kewalaka/terraform-azapi-global-outputs).
+
+Jobs:
+
+1. **build-provider** — builds the `azapi` provider from the data-plane branch
+   (`kewalaka/add-table-storage-dataplane`, i.e. PR #1141, which contains the
+   `data.azapi_data_plane_resource` data source). The binary is cached, keyed to
+   the provider branch HEAD commit.
+2. **plan** — runs on every push and pull request. Configures `dev_overrides`
+   against the cached binary and runs `terraform plan`. Uploads the
+   `{ tfplan, terraform.tfstate }` pair as an artifact.
+3. **apply** — runs on push to `main` and `workflow_dispatch` only. Gated by the
+   `integration` GitHub Environment. Applies the exact saved plan, then always
+   runs `terraform destroy` so nothing is left behind.
+
+### Azure authentication (OIDC, no secrets)
+
+The workflow authenticates to Azure with workload-identity federation — there are
+no client secrets. It expects these **repository variables**:
+
+| Variable | Value |
+| --- | --- |
+| `ARM_CLIENT_ID` | client ID of the user-assigned managed identity used for OIDC |
+| `ARM_TENANT_ID` | Entra tenant ID |
+| `ARM_SUBSCRIPTION_ID` | target subscription ID |
+
+The managed identity needs three federated credentials (GitHub issuer
+`https://token.actions.githubusercontent.com`, audience
+`api://AzureADTokenExchange`) with subjects:
+
+- `repo:<owner>/<repo>:pull_request`
+- `repo:<owner>/<repo>:ref:refs/heads/main`
+- `repo:<owner>/<repo>:environment:integration`
+
+and Azure RBAC sufficient to create the resource group, the AI Search service, and
+the role assignment (`Contributor` + `Role Based Access Control Administrator`, or
+`Owner`, at subscription scope).

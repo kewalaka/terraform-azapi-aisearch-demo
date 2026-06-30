@@ -1,0 +1,222 @@
+name: Integration Test
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "CHANGELOG.md"
+      - "**.md"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "CHANGELOG.md"
+      - "**.md"
+  workflow_dispatch:
+
+# Prevent concurrent applies against the same state.
+# cancel-in-progress: false so an in-flight apply never gets abandoned mid-run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # The demo Terraform lives at the repository root.
+  TF_WORKING_DIR: .
+  # The branch of the azapi provider that contains the data-plane data source
+  # (PR #1141). Our spike branch's unique content (the AI Search example/test)
+  # is not required to BUILD the provider - the data source code is committed
+  # here, and this branch tip is identical to the spike worktree HEAD.
+  PROVIDER_REPO: kewalaka/terraform-provider-azapi
+  PROVIDER_BRANCH: kewalaka/add-table-storage-dataplane
+  # Temp Azure CLI profile - avoids touching ~/.azure on the runner.
+  AZURE_CONFIG_DIR: /tmp/azure-ci-${{ github.run_id }}
+
+jobs:
+  # -- Build the custom azapi provider binary ---------------------------------
+  # Keyed to the provider branch's HEAD commit so cache is invalidated
+  # automatically when the branch is updated.
+  build-provider:
+    name: Build custom azapi provider
+    runs-on: ubuntu-latest
+    outputs:
+      cache_key: ${{ steps.sha.outputs.cache_key }}
+    steps:
+      - name: Resolve provider branch HEAD
+        id: sha
+        run: |
+          SHA=$(git ls-remote "https://github.com/${PROVIDER_REPO}" \
+            "refs/heads/${PROVIDER_BRANCH}" | cut -f1)
+          if [ -z "$SHA" ]; then
+            echo "::error::Could not resolve ${PROVIDER_REPO}#${PROVIDER_BRANCH}"
+            exit 1
+          fi
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "cache_key=azapi-provider-${{ runner.os }}-${SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore cached provider binary
+        id: cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/.local/terraform-plugins/terraform-provider-azapi
+          key: ${{ steps.sha.outputs.cache_key }}
+
+      - name: Clone provider source
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 --branch "${PROVIDER_BRANCH}" \
+            "https://github.com/${PROVIDER_REPO}.git" /tmp/provider-src
+
+      - uses: actions/setup-go@v6
+        if: steps.cache.outputs.cache-hit != 'true'
+        with:
+          go-version: "1.26"
+          cache-dependency-path: /tmp/provider-src/go.sum
+
+      - name: Build provider
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.local/terraform-plugins
+          cd /tmp/provider-src
+          go build -o ~/.local/terraform-plugins/terraform-provider-azapi .
+
+      - name: Save provider binary to cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ~/.local/terraform-plugins/terraform-provider-azapi
+          key: ${{ steps.sha.outputs.cache_key }}
+
+  # -- terraform plan ---------------------------------------------------------
+  # Runs on every push and PR. Uploads the { plan, state } pair as an artifact.
+  plan:
+    name: Terraform Plan
+    needs: build-provider
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # required for OIDC token exchange
+      contents: read
+    env:
+      ARM_CLIENT_ID: ${{ vars.ARM_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.ARM_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC: "true"
+    outputs:
+      artifact_name: tf-run-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Restore provider binary
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/.local/terraform-plugins/terraform-provider-azapi
+          key: ${{ needs.build-provider.outputs.cache_key }}
+          fail-on-cache-miss: true
+
+      - name: Configure Terraform dev_overrides
+        run: |
+          PLUGIN_DIR="$HOME/.local/terraform-plugins"
+          cat > ~/.terraformrc <<TFRC
+          provider_installation {
+            dev_overrides {
+              "Azure/azapi" = "$PLUGIN_DIR"
+            }
+            direct {}
+          }
+          TFRC
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "~1.14"
+
+      - name: terraform init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init -upgrade
+
+      - name: terraform plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform plan -out=tfplan -input=false -detailed-exitcode
+        # exit 0 = no changes, exit 1 = error, exit 2 = changes pending.
+        # The step succeeds on exit 0 or 2 (changes are expected).
+        continue-on-error: true
+        id: plan
+
+      - name: Fail if plan errored
+        if: steps.plan.outcome == 'failure' && steps.plan.outputs.exitcode == '1'
+        run: exit 1
+
+      # Bundle plan + the state as it was at plan time so the apply job uses the
+      # exact same (plan, state) pair - no race condition.
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: tf-run-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.TF_WORKING_DIR }}/tfplan
+            ${{ env.TF_WORKING_DIR }}/terraform.tfstate
+          if-no-files-found: warn
+          retention-days: 2
+
+  # -- terraform apply --------------------------------------------------------
+  # Only runs on pushes to main (and workflow_dispatch). Gated by the
+  # 'integration' GitHub Environment - a reviewer can require approval.
+  # Always destroys at the end so the demo leaves nothing behind.
+  apply:
+    name: Terraform Apply + Destroy
+    needs: [build-provider, plan]
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: integration
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      ARM_CLIENT_ID: ${{ vars.ARM_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.ARM_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC: "true"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Restore provider binary
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/.local/terraform-plugins/terraform-provider-azapi
+          key: ${{ needs.build-provider.outputs.cache_key }}
+          fail-on-cache-miss: true
+
+      - name: Configure Terraform dev_overrides
+        run: |
+          PLUGIN_DIR="$HOME/.local/terraform-plugins"
+          cat > ~/.terraformrc <<TFRC
+          provider_installation {
+            dev_overrides {
+              "Azure/azapi" = "$PLUGIN_DIR"
+            }
+            direct {}
+          }
+          TFRC
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "~1.14"
+
+      # Download the exact { tfplan, terraform.tfstate } pair from the plan job.
+      - name: Download plan artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.plan.outputs.artifact_name }}
+          path: ${{ env.TF_WORKING_DIR }}
+
+      - name: terraform init
+        id: init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init -upgrade
+
+      - name: terraform apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: terraform destroy
+        if: always() && steps.init.outcome == 'success'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform destroy -auto-approve
